@@ -1,0 +1,576 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Client;
+use App\Employee;
+use App\EmployeeHasHourImport;
+use App\EmployeeZzp;
+use App\HourImport;
+use App\House;
+use App\Invoice;
+use App\SpareTime;
+use App\Week;
+use App\ZzpWeek;
+use Carbon\Carbon;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Storage;
+use Maatwebsite\Excel\Facades\Excel;
+use PDF;
+use Response;
+
+class PdfController extends Controller
+{
+    public function invoice($invoiceId)
+    {
+        $invoice = Invoice::where('id', $invoiceId)
+            ->with('additionsTaxed')
+            ->with('additionsUntaxed')
+            ->with('client')
+            ->first();
+
+        if (Auth::user()->type != 'admin' && ($invoice->client->user_id != Auth::user()->id)) {
+            abort(404);
+        }
+
+        $path = '/pdf/invoices';
+        $file = $path . '/' . $invoiceId . '.pdf';
+
+        if (!file_exists(storage_path('app') . $file)) {
+            if (!file_exists($path)) {
+                Storage::makeDirectory($path, 0777, true, true);
+            }
+
+            @PDF::loadView('pdf.invoice' . ($invoice->separate > 0 ? '-separate' : ''), ['invoice' => $invoice])
+                ->setPaper('a4', 'portrait')
+                ->save(storage_path('app') . $file);
+        }
+
+        return Response::make(file_get_contents(storage_path('app') . $file), 200, [
+            'Content-Type' => 'application/pdf',
+            'Content-Disposition' => 'inline; filename="' . $invoiceId . '.pdf"'
+        ]);
+    }
+
+    public function invoiceZzp($company_id, $employee_id, $year, $period)
+    {
+        $startWeek = (($period * 4) + 1);
+        $endWeek = (($period + 1) * 4);
+
+        $weeks = ZzpWeek::where([
+            'company_id' => $company_id,
+            'employee_zzp_id' => $employee_id,
+            'year' => $year
+        ])
+            ->whereBetween('week', [$startWeek, $endWeek])
+            ->get();
+
+        if (!$weeks->count()) {
+            abort(404);
+        }
+
+        $totalCost = 0;
+        foreach ($weeks as $week) {
+            $week->hours_cost = $week->hours * $week->hours_rate;
+            $week->plants_cost = $week->plants * $week->plants_rate;
+            $week->total_cost = $week->hours_cost + $week->plant_cost;
+            $totalCost += $week->total_cost;
+        }
+
+        $employee = EmployeeZzp::find($employee_id);
+        $company = Client::find($company_id);
+
+        $number = str_pad($period, 3, 0, STR_PAD_LEFT) . '.' . $year;
+
+        $invoice = '\App\Invoices\\' . 'InvoiceMain';
+
+        return new $invoice($number, $company, $employee, $weeks, $year, $period, $totalCost);
+    }
+
+    public function contractPhaseOne($filename)
+    {
+        if (!in_array(Auth::user()->type, ['admin', 'employer', 'client'])) {
+            abort(404);
+        }
+        return $this->servePdf('/pdf/contracts/phase1', $filename);
+    }
+
+    public function contractPhaseTwo($filename)
+    {
+        if (!in_array(Auth::user()->type, ['admin', 'employer', 'client'])) {
+            abort(404);
+        }
+        return $this->servePdf('/pdf/contracts/phase2', $filename);
+    }
+
+    public function arrangementEt($filename)
+    {
+        if (!in_array(Auth::user()->type, ['admin', 'employer', 'client'])) {
+            abort(404);
+        }
+        return $this->servePdf('/pdf/arrangements/et', $filename);
+    }
+
+    public function proxyDeduction($filename)
+    {
+        if (!in_array(Auth::user()->type, ['admin', 'employer', 'client'])) {
+            abort(404);
+        }
+        return $this->servePdf('/pdf/deductions', $filename);
+    }
+
+    public function export($week, $year)
+    {
+        $filename = 'export_wpc_' . $week;
+
+        $weeks = Week::where([
+            'week' => $week,
+            'year' => $year
+        ])->get();
+
+        $lastWeek = ($week == 1) ? 52 : ($week - 1);
+        $lastYear = ($week == 1) ? ($year - 1) : $year;
+
+        $lastWeeks = Week::where([
+            'week' => $lastWeek,
+            'year' => $lastYear
+        ])->get();
+
+        $monday = Carbon::createFromDate($year, 1, 1)->addWeek(($week - 1))->startOfWeek();
+        $friday = Carbon::createFromDate($year, 1, 1)->addWeek(($week - 1))->endOfWeek();
+
+        $dates = [];
+
+        for ($date = $monday; $date->lte($friday); $date->addDay()) {
+            $dates[] = $date->format('Y-m-d');
+        }
+
+        $employees = Employee::where('payment', 'per week')
+            ->whereHas('hours', function ($hh) use ($weeks) {
+                $hh->whereIn('week_id', $weeks->pluck('id'))->where('worked', '>', 0);
+            })
+            ->with(['hours' => function ($wh) use ($weeks) {
+                $wh->whereIn('week_id', $weeks->pluck('id'))->where('worked', '>', 0);
+            }, 'spareTime' => function ($s) use ($lastWeeks) {
+                $s->whereIn('week_id', $lastWeeks->pluck('id'));
+            }])->get();
+
+        //        dd($employees->pluck('spareTime')->toArray());
+
+        $hourImport = HourImport::where([
+            'year' => $year,
+            'week' => $week
+        ])->first();
+
+        //        if (!$hourImport) {
+        //            abort(400, 'Er zijn deze week nog geen vakantieuren geimporteerd.');
+        //        }
+
+        //        dd($employees->toArray());
+
+        Excel::create($filename, function ($excel) use ($filename, $employees, $year, $week, $dates, $hourImport) {
+
+            $excel->sheet($filename . '.xls', function ($sheet) use ($employees, $year, $week, $dates, $hourImport) {
+                $sheet->setFontSize(12);
+                $sheet->row(1, [
+                    'Klantnaam',
+                    'Klantcode',
+                    'Werk. Naam',
+                    'Werkn. Code',
+                    'Werkn. Sofi',
+                    'Jaar',
+                    'Week',
+                    'Uursoort',
+                    'Uurloon',
+                    'Werkn. Perc.',
+                    'Tarief fact.',
+                    'Tarief. Perc.',
+                    'Project',
+                    'Uren omschr',
+                    'MA',
+                    'DI',
+                    'WO',
+                    'DO',
+                    'VR',
+                    'ZA',
+                    'ZO',
+                    'totaal'
+                ]);
+
+                $rowNr = 2;
+                $holidayPct = 0.083;
+                $maxPayedHours = 40;
+                $temp = [];
+
+                foreach ($employees as $employee) {
+                    $worked = $employee->hours->sum('worked');
+                    $holding = $employee->spareTime->count() ? floatVal($employee->spareTime->first()->holding) : 0;
+                    $holiday = $employee->spareTime->count() ? floatVal($employee->spareTime->first()->holiday) : 0;
+                    $calculated = [
+                        'worked' => $worked,
+                        'holidayPlus' => 0,
+                        'holidayMin' => 0,
+                        'holidayLeft' => 0,
+                        'payed' => 0,
+                        'overtime' => 0,
+                        'holiday' => 0,
+                        'days' => 0,
+                        'holdingMin' => 0,
+                        'holdingLeft' => 0,
+                        'salary' => $employee->wage(false, false, 'wage'),
+                        'service' => $employee->service_costs,
+                        'housing' => $employee->rent,
+                        'days' => ($employee->hours->count() > 5) ? 5 : $employee->hours->count()
+                    ];
+
+                    $calculated['hours'] = [0 => 0, 1 => 0, 2 => 0, 3 => 0, 4 => 0, 5 => 0, 6 => 0]; //set empty days
+                    $calculated['hours_overtime'] = $calculated['hours']; //set empty days
+                    $workedTotal = 0;
+                    foreach ($dates as $key => $date) {
+                        $dateHour = $employee->hours->where('date', $date);
+                        $workedOnDay = 0;
+
+                        if (count($dateHour)) {
+                            $workedOnDay = $dateHour->sum('worked');
+                        }
+
+                        if ($workedTotal < $maxPayedHours) {
+                            if (($workedTotal + $workedOnDay) > $maxPayedHours) {
+                                $calculated['hours'][$key] = ($maxPayedHours - $workedTotal);
+                                $calculated['hours_overtime'][$key] = ($workedOnDay - $calculated['hours'][$key]);
+                                $workedTotal = 40;
+                            } else {
+                                $calculated['hours'][$key] = $workedOnDay;
+                                $workedTotal += $workedOnDay;
+                            }
+                        } else {
+                            $calculated['hours_overtime'][$key] = $workedOnDay;
+                            $workedTotal = 40;
+                        }
+                    }
+
+                    if ($worked > $maxPayedHours) {
+                        $calculated['payed'] = $maxPayedHours;
+                        $calculated['overtime'] = $worked - $maxPayedHours;
+                        $calculated['holidayPlus'] = round($worked * $holidayPct, 2);
+                        $calculated['holidayLeft'] = $holiday + $calculated['holidayPlus'];
+                        $calculated['holdingLeft'] = $holding;
+                    } elseif ($worked == $maxPayedHours) {
+                        $calculated['payed'] = $maxPayedHours;
+                        $calculated['holidayPlus'] = round($worked * $holidayPct, 2);
+                        $calculated['holidayLeft'] = $holiday + $calculated['holidayPlus'];
+                        $calculated['holdingLeft'] = $holding;
+                    } else {
+                        $maxHoliday = round(($worked + $holding) * $holidayPct, 2) + $holiday;
+
+                        if (($worked + $holding) >= $maxPayedHours) {
+                            $calculated['payed'] = $worked;
+                            $calculated['holdingMin'] = $maxPayedHours - $worked;
+                            $calculated['holdingLeft'] = $holding - $calculated['holdingMin'];
+                            $calculated['holidayPlus'] = round($calculated['payed'] * $holidayPct, 2);
+                            $calculated['holidayLeft'] = $holiday + $calculated['holidayPlus'];
+                        } elseif (($worked + $holding + $maxHoliday) >= $maxPayedHours) {
+                            $calculated['payed'] = $worked;
+                            $calculated['holdingMin'] = $holding;
+                            $calculated['holdingLeft'] = 0;
+                            $calculated['holidayPlus'] = round(($worked + $holding) * $holidayPct, 2);
+                            $calculated['holidayMin'] = round($maxPayedHours - ($worked + $holding), 2);
+                            $calculated['holidayLeft'] = $maxHoliday - $calculated['holidayMin'];
+                        } else {
+                            $calculated['payed'] = $worked;
+                            $calculated['holdingMin'] = $holding;
+                            $calculated['holdingLeft'] = 0;
+                            $calculated['holidayPlus'] = round(($worked + $holding) * $holidayPct, 2);
+                            $calculated['holidayMin'] = round($maxHoliday, 2);
+                            $calculated['holidayLeft'] = 0;
+                        }
+                    }
+
+                    $hoursWeekly = $maxPayedHours;
+
+                    if ($worked < $hoursWeekly) {
+                        $holidayHours = 0;
+                        $dbHolidayHours = false;
+                        if ($hourImport) {
+                            $dbHolidayHours = EmployeeHasHourImport::where([
+                                'hour_import_id' => $hourImport->id,
+                                'employee_id' => $employee->id
+                            ])->first();
+                        }
+                        if ($dbHolidayHours) {
+                            $holidayHours = floatval($dbHolidayHours->hours);
+                        }
+
+                        $holidayHoursNeeded = $hoursWeekly - ($worked + $calculated['holidayMin']);
+
+                        if ($holidayHours >= $holidayHoursNeeded) {
+                            $calculated['holiday'] = round($holidayHoursNeeded, 2);
+                        } else {
+                            $calculated['holiday'] = round($holidayHours, 2);
+                        }
+                    }
+
+                    //                    if ($employee->id == 109) {
+                    //                        dd($employee->toArray(), $calculated, $hoursWeekly, $worked, $calculated['holidayMin'], $holidayHoursNeeded);
+                    //                    }
+
+                    $spareTime = SpareTime::firstOrNew([
+                        'employee_id' => $employee->id,
+                        'week_id' => $employee->hours->first()->week_id
+                    ]);
+                    $spareTime->holiday = $calculated['holidayLeft'];
+                    $spareTime->holding = $calculated['holdingLeft'];
+                    $spareTime->save();
+
+                    $client = Week::find($employee->hours->first()->week_id)->client;
+
+                    $excelArray = [
+                        0 => $client->name,
+                        1 => '1',                   //klantcode
+                        2 => $employee->name(),     //werk naam
+                        3 => $employee->identifier, //werkn code
+                        4 => $employee->sofi,       //werkn sofi
+                        5 => $year,                 //jaar
+                        6 => $week,                 //week
+                        7 => null,                  //uursoort
+                        8 => $calculated['salary'], //uurloon
+                        9 => null,                  //werkn perc
+                        10 => $employee->calculated,                    //tarief fact
+                        11 => 0,                    //tarief perc
+                        12 => null,                 //project
+                        13 => null,                 //uren omschr
+                        14 => null,                 //ma
+                        15 => null,                 //di
+                        16 => null,                 //wo
+                        17 => null,                 //do
+                        18 => null,                 //vr
+                        19 => null,                 //za
+                        20 => null,                 //zo
+                        21 => null                  //totaal
+                    ];
+
+                    $grandTotal = 0;
+
+                    if ($calculated['payed'] > 0) {
+                        $insert = $excelArray;
+                        $insert[7] = 0;
+                        $insert[9] = 100;
+                        $totalRow = 0;
+                        foreach ($calculated['hours'] as $key => $hourRow) {
+                            if ($hourRow > 0) {
+                                $insert[14 + $key] = round($hourRow, 2);
+                                $totalRow += round($hourRow, 2);
+                                $grandTotal += round($hourRow, 2);
+                            }
+                        }
+                        $insert[21] = $totalRow;
+                        $sheet->row($rowNr, $insert);
+                        //                        $temp[$rowNr] = $insert;
+                        $rowNr++;
+                    }
+
+                    if ($calculated['overtime'] > 0) {
+                        $insert = $excelArray;
+                        $insert[7] = 2;
+                        $insert[9] = 135;
+                        $insert[13] = 'Overwerk 135%';
+                        $totalRow = 0;
+                        foreach ($calculated['hours_overtime'] as $key => $hourRow) {
+                            if ($hourRow > 0) {
+                                $insert[14 + $key] = round($hourRow, 2);
+                                $totalRow += round($hourRow, 2);
+                                $grandTotal += round($hourRow, 2);
+                            }
+                        }
+                        $insert[21] = $totalRow;
+                        $sheet->row($rowNr, $insert);
+                        //                        $temp[$rowNr] = $insert;
+                        $rowNr++;
+                    }
+
+                    if ($calculated['holidayMin'] > 0) {
+                        $insert = $excelArray;
+                        $insert[7] = 7;
+                        $insert[9] = 100;
+                        $insert[13] = 'Opgenomen vakantieuren';
+                        $insert[14] = $calculated['holidayMin'];
+
+                        $totalRow = $calculated['holidayMin'];
+                        $grandTotal += $calculated['holidayMin'];
+
+                        if ($calculated['holiday'] > 0) {
+                            $insert[15] = $calculated['holiday'];
+
+                            $totalRow += $calculated['holiday'];
+                            $grandTotal += $calculated['holiday'];
+                        }
+
+                        $insert[21] = $totalRow;
+
+                        $sheet->row($rowNr, $insert);
+                        $rowNr++;
+                    }
+
+                    if ($calculated['holdingMin'] > 0) {
+                        $insert = $excelArray;
+                        $insert[7] = 2;
+                        $insert[9] = 100;
+                        $insert[14] = $calculated['holdingMin'];
+                        $insert[21] = $calculated['holdingMin'];
+                        $grandTotal += $calculated['holdingMin'];
+                        $sheet->row($rowNr, $insert);
+                        //                        $temp[$rowNr] = $insert;
+                        $rowNr++;
+                    }
+                }
+            });
+        })->export('xls');
+
+        //        dd($temp);
+    }
+
+    public function workedInWeeks()
+    {
+        $filename = 'export_wpc_uren';
+
+        $clients = Client::with(['weeks' => function ($weeks) {
+            $weeks->where('year', 2018)
+                ->whereBetween('week', [1, 26])
+                ->with('hours');
+        }])->get();
+
+        $employees = Employee::select('id', 'identifier', 'firstname', 'insertion', 'lastname')
+            ->get()
+            ->keyBy('id');
+
+        Excel::create($filename, function ($excel) use ($filename, $clients, $employees) {
+            foreach ($clients as $client) {
+                $excel->sheet(substr($client->name, 0, 31), function ($sheet) use ($client, $employees) {
+                    $sheet->setFontSize(16);
+                    $sheet->cell('A1', function ($cell) {
+                        $cell->setFontWeight('bold');
+                    });
+                    $sheet->row(1, [
+                        $client->name
+                    ]);
+                    $sheet->setFontSize(12);
+                    $sheet->row(2, [
+                        'Pers. Nr.',
+                        'Naam',
+                        'Uren'
+                    ]);
+
+                    $rowNr = 3;
+                    $clientTotal = 0;
+                    $clientEmployees = $client->weeks->pluck('hours')->flatten()->groupBy('employee_id');
+
+                    foreach ($clientEmployees as $employeeId => $hours) {
+                        $employee = $employees[$employeeId];
+                        $hoursWorked = $hours->sum('worked');
+
+                        $sheet->row($rowNr, [
+                            $employee->identifier,
+                            $employee->fullname(),
+                            number_format($hoursWorked, 2, ',', '.')
+                        ]);
+
+                        $clientTotal += $hoursWorked;
+                        $rowNr++;
+                    }
+
+                    $sheet->row($rowNr, [
+                        'Totaal',
+                        '',
+                        $clientTotal
+                    ]);
+                });
+            }
+        })->export('xls');
+    }
+
+    public function housing()
+    {
+        $filename = 'export_wpc_housing';
+
+        $houses = House::orderBy('name')
+            ->with('employees')
+            ->with('currentEmployees')
+            ->get();
+
+        $now = Carbon::now()->startOfWeek()->format('Y-m-d');
+
+        $periods = [
+            'present' => 'Huidig',
+            'past' => 'Verleden',
+            'future' => 'Toekomstig'
+        ];
+
+        Excel::create($filename, function ($excel) use ($filename, $houses, $now, $periods) {
+            $excel->sheet($filename . '.xls', function ($sheet) use ($houses, $now, $periods) {
+                $sheet->setFontSize(12);
+
+                $sheet->row(1, [
+                    'Naam',
+                    'Adres',
+                    'Postcode',
+                    'Plaats',
+                    'Pers. Nr.',
+                    'Voornaam',
+                    'Achternaam',
+                    'Startdatum',
+                    'Einddatum',
+                    'Periode',
+                    'Huur'
+                ]);
+
+                $rowNr = 2;
+
+                foreach ($houses as $house) {
+                    foreach ($house->employees as $employee) {
+                        $employee->pivot_id = $employee->pivot->id;
+
+                        $employee->house_period = 'present';
+
+                        if ($employee->house_end && $employee->house_end < $now) {
+                            $employee->house_period = 'past';
+                        } elseif ($employee->house_start > $now) {
+                            $employee->house_period = 'future';
+                        }
+
+                        $insert = [
+                            $house->name,
+                            $house->street . ' ' . $house->street_number,
+                            $house->postal,
+                            $house->city,
+                            $employee->identifier,
+                            $employee->firstname,
+                            $employee->insertion . ($employee->insertion ? ' ' : '') . $employee->lastname,
+                            $employee->house_start,
+                            $employee->house_end,
+                            $periods[$employee->house_period],
+                            $employee->house_rent
+                        ];
+
+                        $sheet->row($rowNr, $insert);
+                        $rowNr++;
+                    }
+                }
+            });
+        })->export('xls');
+    }
+
+    protected function servePdf($path, $filename)
+    {
+        $filename = str_replace('.pdf', '', $filename);
+        $file = $path . '/' . $filename . '.pdf';
+
+        if (!file_exists(storage_path('app') . $file)) {
+            abort(404);
+        }
+
+        return Response::make(file_get_contents(storage_path('app') . $file), 200, [
+            'Content-Type' => 'application/pdf',
+            'Content-Disposition' => 'inline; filename="' . $filename . '.pdf"'
+        ]);
+    }
+}
